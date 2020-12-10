@@ -19,6 +19,7 @@ import argparse
 import datetime
 import sys
 import os
+import traceback
 
 import torch
 import torch.nn as nn
@@ -59,7 +60,7 @@ parser.add_argument('--encoder',                   type=str,   help='type of enc
 # Dataset
 parser.add_argument('--dataset',                   type=str,   help='dataset to train on, kitti or nyu', default='nyu')
 parser.add_argument('--data_path',                 type=str,   help='path to the data', required=True)
-parser.add_argument('--gt_path',                   type=str,   help='path to the groundtruth data', required=True)
+parser.add_argument('--gt_path',                   type=str,   help='path to the groundtruth data', required=False)
 parser.add_argument('--filenames_file',            type=str,   help='path to the filenames text file', required=True)
 parser.add_argument('--input_height',              type=int,   help='input height', default=480)
 parser.add_argument('--input_width',               type=int,   help='input width',  default=640)
@@ -85,6 +86,8 @@ parser.add_argument('--num_epochs',                type=int,   help='number of e
 parser.add_argument('--learning_rate',             type=float, help='initial learning rate', default=1e-4)
 parser.add_argument('--end_learning_rate',         type=float, help='end learning rate', default=-1)
 parser.add_argument('--variance_focus',            type=float, help='lambda in paper: [0, 1], higher value more focus on minimizing variance of error', default=0.85)
+parser.add_argument('--inlier_loss_weight',        type=float, help='inlier loss weight', default=1.)
+parser.add_argument('--param_loss_weight',         type=float, help='param loss weight', default=1.)
 
 # Preprocessing
 parser.add_argument('--do_random_rotate',                      help='if set, will perform random rotation for augmentation', action='store_true')
@@ -93,7 +96,7 @@ parser.add_argument('--do_kb_crop',                            help='if set, cro
 parser.add_argument('--use_right',                             help='if set, will randomly use right images when train on KITTI', action='store_true')
 
 # Multi-gpu training
-parser.add_argument('--num_threads',               type=int,   help='number of threads to use for data loading', default=1)
+parser.add_argument('--num_threads',               type=int,   help='number of threads to use for data loading', default=0)
 parser.add_argument('--world_size',                type=int,   help='number of nodes for distributed training', default=1)
 parser.add_argument('--rank',                      type=int,   help='node rank for distributed training', default=0)
 parser.add_argument('--dist_url',                  type=str,   help='url used to set up distributed training', default='tcp://127.0.0.1:1234')
@@ -125,15 +128,15 @@ else:
 if args.mode == 'train' and not args.checkpoint_path:
     from bts import *
 
-elif args.mode == 'train' and args.checkpoint_path:
-    model_dir = os.path.dirname(args.checkpoint_path)
-    model_name = os.path.basename(model_dir)
-    import sys
-    sys.path.append(model_dir)
-    for key, val in vars(__import__(model_name)).items():
-        if key.startswith('__') and key.endswith('__'):
-            continue
-        vars()[key] = val
+# elif args.mode == 'train' and args.checkpoint_path:
+#     model_dir = os.path.dirname(args.checkpoint_path)
+#     model_name = os.path.basename(model_dir)
+#     import sys
+#     sys.path.append(model_dir)
+    # for key, val in vars(__import__(model_name)).items():
+    #     if key.startswith('__') and key.endswith('__'):
+    #         continue
+    #     vars()[key] = val
 
 
 inv_normalize = transforms.Normalize(
@@ -141,7 +144,7 @@ inv_normalize = transforms.Normalize(
     std=[1/0.229, 1/0.224, 1/0.225]
 )
 
-eval_metrics = ['silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3']
+eval_metrics = ['silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3', 'plane_err']
 
 
 def compute_errors(gt, pred):
@@ -166,6 +169,22 @@ def compute_errors(gt, pred):
     log10 = np.mean(err)
 
     return [silog, abs_rel, log10, rms, sq_rel, log_rms, d1, d2, d3]
+
+
+def compute_plane_errors(gt, pred, seg_map):
+    for ins in np.unique(seg_map):
+        if ins == 0:
+            continue
+        mask = seg_map == ins
+        ins_param = pred[:, mask].mean(axis=1)
+        pred[:, mask] = ins_param.repeat(mask.sum()).reshape(3, -1)
+
+    valid = (seg_map > 0)
+    pred_valid = pred[:, valid]
+    gt_valid = gt[:, valid]
+    err = np.abs(gt_valid - pred_valid).sum(axis=0).mean()
+
+    return err
 
 
 def block_print():
@@ -251,29 +270,22 @@ def set_misc(model):
 
 
 def online_eval(model, dataloader_eval, gpu, ngpus):
-    eval_measures = torch.zeros(10).cuda(device=gpu)
+    eval_measures = torch.zeros(11).cuda(device=gpu)
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
         with torch.no_grad():
             image = torch.autograd.Variable(eval_sample_batched['image'].cuda(gpu, non_blocking=True))
             focal = torch.autograd.Variable(eval_sample_batched['focal'].cuda(gpu, non_blocking=True))
             gt_depth = eval_sample_batched['depth']
-            has_valid_depth = eval_sample_batched['has_valid_depth']
-            if not has_valid_depth:
-                # print('Invalid depth. continue.')
-                continue
+            gt_plane = eval_sample_batched['plane']
+            ins_mask = eval_sample_batched['mask']
 
-            _, _, _, _, _, pred_depth = model(image, focal)
+            _, _, _, _, pred_depth, _, _, _, pred_plane = model(image, focal)
 
             pred_depth = pred_depth.cpu().numpy().squeeze()
+            pred_plane = pred_plane.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
-
-        if args.do_kb_crop:
-            height, width = gt_depth.shape
-            top_margin = int(height - 352)
-            left_margin = int((width - 1216) / 2)
-            pred_depth_uncropped = np.zeros((height, width), dtype=np.float32)
-            pred_depth_uncropped[top_margin:top_margin + 352, left_margin:left_margin + 1216] = pred_depth
-            pred_depth = pred_depth_uncropped
+            gt_plane = gt_plane.cpu().numpy().squeeze()
+            ins_mask = ins_mask.cpu().numpy().squeeze()
 
         pred_depth[pred_depth < args.min_depth_eval] = args.min_depth_eval
         pred_depth[pred_depth > args.max_depth_eval] = args.max_depth_eval
@@ -298,9 +310,11 @@ def online_eval(model, dataloader_eval, gpu, ngpus):
             valid_mask = np.logical_and(valid_mask, eval_mask)
 
         measures = compute_errors(gt_depth[valid_mask], pred_depth[valid_mask])
+        plane_err = compute_plane_errors(gt_plane, pred_plane, ins_mask)
 
         eval_measures[:9] += torch.tensor(measures).cuda(device=gpu)
-        eval_measures[9] += 1
+        eval_measures[9] += torch.tensor(plane_err).cuda(device=gpu)
+        eval_measures[10] += 1
 
     if args.multiprocessing_distributed:
         group = dist.new_group([i for i in range(ngpus)])
@@ -308,15 +322,15 @@ def online_eval(model, dataloader_eval, gpu, ngpus):
 
     if not args.multiprocessing_distributed or gpu == 0:
         eval_measures_cpu = eval_measures.cpu()
-        cnt = eval_measures_cpu[9].item()
+        cnt = eval_measures_cpu[10].item()
         eval_measures_cpu /= cnt
         print('Computing errors for {} eval samples'.format(int(cnt)))
-        print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format('silog', 'abs_rel', 'log10', 'rms',
-                                                                                     'sq_rel', 'log_rms', 'd1', 'd2',
-                                                                                     'd3'))
-        for i in range(8):
+        print("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}".format('silog', 'abs_rel', 'log10', 'rms',
+                                                                                            'sq_rel', 'log_rms', 'd1', 'd2', 'd3',
+                                                                                            'plane_abs'))
+        for i in range(9):
             print('{:7.3f}, '.format(eval_measures_cpu[i]), end='')
-        print('{:7.3f}'.format(eval_measures_cpu[8]))
+        print('{:7.3f}'.format(eval_measures_cpu[9]))
         return eval_measures_cpu
 
     return None
@@ -366,9 +380,10 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Model Initialized")
 
     global_step = 0
-    best_eval_measures_lower_better = torch.zeros(6).cpu() + 1e3
-    best_eval_measures_higher_better = torch.zeros(3).cpu()
-    best_eval_steps = np.zeros(9, dtype=np.int32)
+    # best_eval_measures_lower_better = torch.zeros(6).cpu() + 1e3
+    # best_eval_measures_higher_better = torch.zeros(3).cpu()
+    best_eval_steps = np.zeros(1, dtype=np.int32)
+    best_eval_plane_lower_better = torch.zeros(1).cpu() + 1e3
 
     # Training parameters
     optimizer = torch.optim.AdamW([{'params': model.module.encoder.parameters(), 'weight_decay': args.weight_decay},
@@ -385,15 +400,16 @@ def main_worker(gpu, ngpus_per_node, args):
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.checkpoint_path, map_location=loc)
             global_step = checkpoint['global_step']
-            model.load_state_dict(checkpoint['model'])
+            model.load_state_dict(checkpoint['model'], strict=False)
             try:
                 optimizer.load_state_dict(checkpoint['optimizer'])
             except:
                 print("Could not load optimizer")
             try:
-                best_eval_measures_higher_better = checkpoint['best_eval_measures_higher_better'].cpu()
-                best_eval_measures_lower_better = checkpoint['best_eval_measures_lower_better'].cpu()
+                # best_eval_measures_higher_better = checkpoint['best_eval_measures_higher_better'].cpu()
+                # best_eval_measures_lower_better = checkpoint['best_eval_measures_lower_better'].cpu()
                 best_eval_steps = checkpoint['best_eval_steps']
+                best_eval_plane_lower_better = checkpoint['best_eval_plane_lower_better'].cpu()
             except KeyError:
                 print("Could not load values for online evaluation")
 
@@ -421,6 +437,7 @@ def main_worker(gpu, ngpus_per_node, args):
             eval_summary_writer = SummaryWriter(eval_summary_path, flush_secs=30)
 
     silog_criterion = silog_loss(variance_focus=args.variance_focus)
+    plane_criterion = plane_loss()
 
     start_time = time.time()
     duration = 0
@@ -449,15 +466,22 @@ def main_worker(gpu, ngpus_per_node, args):
             image = torch.autograd.Variable(sample_batched['image'].cuda(args.gpu, non_blocking=True))
             focal = torch.autograd.Variable(sample_batched['focal'].cuda(args.gpu, non_blocking=True))
             depth_gt = torch.autograd.Variable(sample_batched['depth'].cuda(args.gpu, non_blocking=True))
+            ins_mask = torch.autograd.Variable(sample_batched['mask'].cuda(args.gpu, non_blocking=True))   # (N, 20, H, W)
+            plane_gt = torch.autograd.Variable(sample_batched['plane'].cuda(args.gpu, non_blocking=True))  # (N, 20, 3)
 
-            lpg8x8, lpg4x4, lpg2x2, reduc1x1, last_feat, depth_est = model(image, focal)
+            lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est, plane8x8, plane4x4, plane2x2, plane_est = model(image, focal)
 
             if args.dataset == 'nyu':
                 mask = depth_gt > 0.1
             else:
                 mask = depth_gt > 1.0
 
-            loss = silog_criterion.forward(depth_est, depth_gt, mask.to(torch.bool))
+            depth_loss = silog_criterion.forward(depth_est, depth_gt, mask.to(torch.bool))
+            inlier_loss, param_loss = plane_criterion.forward(plane8x8, plane4x4, plane2x2, plane_est, plane_gt, ins_mask)
+            inlier_loss *= args.inlier_loss_weight
+            param_loss *= args.param_loss_weight
+            loss = depth_loss + inlier_loss + param_loss
+
             loss.backward()
             for param_group in optimizer.param_groups:
                 current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
@@ -467,7 +491,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
                 if global_step % args.print_freq == 0:
-                    print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
+                    print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.7f}, loss: {:.4f}, depth_loss: {:.4f}, inlier_loss: {:.4f}, param_loss: {:.4f}'.format(
+                        epoch, step, steps_per_epoch, global_step, current_lr, loss, depth_loss, inlier_loss, param_loss))
                 if np.isnan(loss.cpu().item()):
                     print('NaN in loss occurred. Aborting training.')
                     return -1
@@ -488,18 +513,25 @@ def main_worker(gpu, ngpus_per_node, args):
 
                 if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                             and args.rank % ngpus_per_node == 0):
-                    writer.add_scalar('silog_loss', loss, global_step)
+                    writer.add_scalar('total loss', loss, global_step)
+                    writer.add_scalar('depth loss', depth_loss, global_step)
+                    writer.add_scalar('inlier loss', inlier_loss, global_step)
+                    writer.add_scalar('param loss', param_loss, global_step)
                     writer.add_scalar('learning_rate', current_lr, global_step)
                     writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
                     depth_gt = torch.where(depth_gt < 1e-3, depth_gt * 0 + 1e3, depth_gt)
-                    for i in range(num_log_images):
-                        writer.add_image('depth_gt/image/{}'.format(i), normalize_result(1/depth_gt[i, :, :, :].data), global_step)
-                        writer.add_image('depth_est/image/{}'.format(i), normalize_result(1/depth_est[i, :, :, :].data), global_step)
-                        writer.add_image('reduc1x1/image/{}'.format(i), normalize_result(1/reduc1x1[i, :, :, :].data), global_step)
-                        writer.add_image('lpg2x2/image/{}'.format(i), normalize_result(1/lpg2x2[i, :, :, :].data), global_step)
-                        writer.add_image('lpg4x4/image/{}'.format(i), normalize_result(1/lpg4x4[i, :, :, :].data), global_step)
-                        writer.add_image('lpg8x8/image/{}'.format(i), normalize_result(1/lpg8x8[i, :, :, :].data), global_step)
-                        writer.add_image('image/image/{}'.format(i), inv_normalize(image[i, :, :, :]).data, global_step)
+                    try:
+                        for i in range(num_log_images):
+                            writer.add_image('depth_gt/image/{}'.format(i), normalize_result(1/depth_gt[i, :, :, :].data), global_step)
+                            writer.add_image('depth_est/image/{}'.format(i), normalize_result(1/depth_est[i, :, :, :].data), global_step)
+                            writer.add_image('reduc1x1/image/{}'.format(i), normalize_result(1/reduc1x1[i, :, :, :].data), global_step)
+                            writer.add_image('lpg2x2/image/{}'.format(i), normalize_result(1/lpg2x2[i, :, :, :].data), global_step)
+                            writer.add_image('lpg4x4/image/{}'.format(i), normalize_result(1/lpg4x4[i, :, :, :].data), global_step)
+                            writer.add_image('lpg8x8/image/{}'.format(i), normalize_result(1/lpg8x8[i, :, :, :].data), global_step)
+                            writer.add_image('image/image/{}'.format(i), inv_normalize(image[i, :, :, :]).data, global_step)
+                    except:
+                        print(traceback.print_exc())
+                        continue
                     writer.flush()
 
             if not args.do_online_eval and global_step and global_step % args.save_freq == 0:
@@ -514,36 +546,58 @@ def main_worker(gpu, ngpus_per_node, args):
                 model.eval()
                 eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node)
                 if eval_measures is not None:
-                    for i in range(9):
+                    for i in range(10):
                         eval_summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))
                         measure = eval_measures[i]
                         is_best = False
-                        if i < 6 and measure < best_eval_measures_lower_better[i]:
-                            old_best = best_eval_measures_lower_better[i].item()
-                            best_eval_measures_lower_better[i] = measure.item()
-                            is_best = True
-                        elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
-                            old_best = best_eval_measures_higher_better[i-6].item()
-                            best_eval_measures_higher_better[i-6] = measure.item()
+                        # if i < 6 and measure < best_eval_measures_lower_better[i]:
+                        #     old_best = best_eval_measures_lower_better[i].item()
+                        #     best_eval_measures_lower_better[i] = measure.item()
+                        #     is_best = True
+                        # elif 6 <= i <= 8 and measure > best_eval_measures_higher_better[i-6]:
+                        #     old_best = best_eval_measures_higher_better[i-6].item()
+                        #     best_eval_measures_higher_better[i-6] = measure.item()
+                        #     is_best = True
+                        # if is_best:
+                        #     old_best_step = best_eval_steps[i]
+                        #     old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
+                        #     model_path = args.log_directory + '/' + args.model_name + old_best_name
+                        #     if os.path.exists(model_path):
+                        #         command = 'rm {}'.format(model_path)
+                        #         os.system(command)
+                        #     best_eval_steps[i] = global_step
+                        #     model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
+                        #     print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
+                        #     checkpoint = {'global_step': global_step,
+                        #                   'model': model.state_dict(),
+                        #                   'optimizer': optimizer.state_dict(),
+                        #                   'best_eval_measures_higher_better': best_eval_measures_higher_better,
+                        #                   'best_eval_measures_lower_better': best_eval_measures_lower_better,
+                        #                   'best_eval_steps': best_eval_steps
+                        #                   }
+                        #     torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+                        if i == 9 and measure < best_eval_plane_lower_better[0]:
+                            old_best = best_eval_plane_lower_better[0].item()
+                            best_eval_plane_lower_better[0] = measure.item()
                             is_best = True
                         if is_best:
-                            old_best_step = best_eval_steps[i]
-                            old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
+                            old_best_step = best_eval_steps[0]
+                            old_best_name = '/model-{}-{:.5f}'.format(old_best_step, old_best)
                             model_path = args.log_directory + '/' + args.model_name + old_best_name
                             if os.path.exists(model_path):
                                 command = 'rm {}'.format(model_path)
                                 os.system(command)
-                            best_eval_steps[i] = global_step
-                            model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
+                            best_eval_steps[0] = global_step
+                            model_save_name = '/model-{}-{:.5f}'.format(global_step, measure)
                             print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
                             checkpoint = {'global_step': global_step,
                                           'model': model.state_dict(),
                                           'optimizer': optimizer.state_dict(),
-                                          'best_eval_measures_higher_better': best_eval_measures_higher_better,
-                                          'best_eval_measures_lower_better': best_eval_measures_lower_better,
+                                          'best_eval_plane_lower_better': best_eval_plane_lower_better,
                                           'best_eval_steps': best_eval_steps
                                           }
                             torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+
                     eval_summary_writer.flush()
                 model.train()
                 block_print()

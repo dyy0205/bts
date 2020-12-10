@@ -19,8 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as torch_nn_func
 import math
 
-from collections import namedtuple
-
 
 # This sets the batch norm layers in pytorch as if {'is_training': False, 'scale': True} in tensorflow
 def bn_init_as_tf(m):
@@ -46,6 +44,59 @@ class silog_loss(nn.Module):
     def forward(self, depth_est, depth_gt, mask):
         d = torch.log(depth_est[mask]) - torch.log(depth_gt[mask])
         return torch.sqrt((d ** 2).mean() - self.variance_focus * (d.mean() ** 2)) * 10.0
+
+
+class plane_loss(nn.Module):
+    def __init__(self):
+        super(plane_loss, self).__init__()
+
+    def compute_loss(self, norm_est, norms, masks, device, param_flag=False):
+        """
+        :param norm_est: tensor with size (3, h, w)
+        :param norms: tensor with size (20, 3)
+        :param masks: tensor with size (20, h, w)
+        """
+        assert norm_est.shape[1:] == masks.shape[1:]
+        inlier_loss, param_loss = 0., 0.
+        count = 0
+        for i in range(masks.shape[0]):
+            valid = (masks[i] > 0)
+            if valid.sum() > 0:
+                count += 1
+                est_valid = norm_est[:, valid]  # (3, n)
+                # in-plane
+                est_mean = est_valid.mean(dim=1).view(-1, 1)
+                diff = torch.mean(torch.sum(torch.abs(est_valid - est_mean), dim=0))
+                inlier_loss += diff
+
+                if param_flag:
+                    gt_valid = norms[i].view(-1, 1)
+                    _loss = torch.mean(torch.sum(torch.abs(est_valid - gt_valid), dim=0))
+                    param_loss += _loss
+        if count != 0:
+            if param_flag:
+                return inlier_loss / count, param_loss / count
+            else:
+                return inlier_loss / count, torch.zeros(1).to(device)
+        else:
+            return torch.zeros(1).to(device), torch.zeros(1).to(device)
+
+    def forward(self, plane8x8, plane4x4, plane2x2, plane_est, plane_gt, ins_mask):
+        n, c, h, w = ins_mask.shape
+        device = ins_mask.device
+        mask8x8 = torch_nn_func.interpolate(ins_mask, scale_factor=1/8., mode='nearest')
+        mask4x4 = torch_nn_func.interpolate(ins_mask, scale_factor=1/4., mode='nearest')
+        mask2x2 = torch_nn_func.interpolate(ins_mask, scale_factor=1/2., mode='nearest')
+
+        inlier_loss, param_loss = 0., 0.
+        for i in range(n):
+            inlier1x1, param1x1 = self.compute_loss(plane_est[i], plane_gt[i], ins_mask[i], device, param_flag=True)
+            inlier8x8, _ = self.compute_loss(plane8x8[i], plane_gt[i], mask8x8[i], device)
+            inlier4x4, _ = self.compute_loss(plane4x4[i], plane_gt[i], mask4x4[i], device)
+            inlier2x2, _ = self.compute_loss(plane2x2[i], plane_gt[i], mask2x2[i], device)
+            inlier_loss += (inlier1x1 + inlier8x8 + inlier4x4 + inlier2x2) / 4.
+            param_loss += param1x1
+        return inlier_loss / n, param_loss / n
 
 
 class atrous_conv(nn.Sequential):
@@ -192,6 +243,7 @@ class bts(nn.Module):
                                               nn.ELU())
         self.get_depth  = torch.nn.Sequential(nn.Conv2d(num_features // 16, 1, 3, 1, 1, bias=False),
                                               nn.Sigmoid())
+        self.get_plane  = torch.nn.Sequential(nn.Conv2d(num_features // 16, 3, 3, 1, 1, bias=False))
 
     def forward(self, features, focal):
         skip0, skip1, skip2, skip3 = features[1], features[2], features[3], features[4]
@@ -221,7 +273,7 @@ class bts(nn.Module):
         
         reduc8x8 = self.reduc8x8(daspp_feat)
         plane_normal_8x8 = reduc8x8[:, :3, :, :]
-        plane_normal_8x8 = torch_nn_func.normalize(plane_normal_8x8, 2, 1)
+        plane_normal_8x8 = torch_nn_func.normalize(plane_normal_8x8, 2, 1)  # H/8, 3
         plane_dist_8x8 = reduc8x8[:, 3, :, :]
         plane_eq_8x8 = torch.cat([plane_normal_8x8, plane_dist_8x8.unsqueeze(1)], 1)
         depth_8x8 = self.lpg8x8(plane_eq_8x8, focal)
@@ -235,7 +287,7 @@ class bts(nn.Module):
         
         reduc4x4 = self.reduc4x4(iconv3)
         plane_normal_4x4 = reduc4x4[:, :3, :, :]
-        plane_normal_4x4 = torch_nn_func.normalize(plane_normal_4x4, 2, 1)
+        plane_normal_4x4 = torch_nn_func.normalize(plane_normal_4x4, 2, 1)  # H/4, 3
         plane_dist_4x4 = reduc4x4[:, 3, :, :]
         plane_eq_4x4 = torch.cat([plane_normal_4x4, plane_dist_4x4.unsqueeze(1)], 1)
         depth_4x4 = self.lpg4x4(plane_eq_4x4, focal)
@@ -249,7 +301,7 @@ class bts(nn.Module):
         
         reduc2x2 = self.reduc2x2(iconv2)
         plane_normal_2x2 = reduc2x2[:, :3, :, :]
-        plane_normal_2x2 = torch_nn_func.normalize(plane_normal_2x2, 2, 1)
+        plane_normal_2x2 = torch_nn_func.normalize(plane_normal_2x2, 2, 1)  # H/2, 3
         plane_dist_2x2 = reduc2x2[:, 3, :, :]
         plane_eq_2x2 = torch.cat([plane_normal_2x2, plane_dist_2x2.unsqueeze(1)], 1)
         depth_2x2 = self.lpg2x2(plane_eq_2x2, focal)
@@ -262,8 +314,10 @@ class bts(nn.Module):
         final_depth = self.params.max_depth * self.get_depth(iconv1)
         if self.params.dataset == 'kitti':
             final_depth = final_depth * focal.view(-1, 1, 1, 1).float() / 715.0873
-        
-        return depth_8x8_scaled, depth_4x4_scaled, depth_2x2_scaled, reduc1x1, iconv1, final_depth
+        plane_param = self.get_plane(iconv1)
+
+        return depth_8x8_scaled, depth_4x4_scaled, depth_2x2_scaled, reduc1x1, final_depth, \
+               plane_normal_8x8, plane_normal_4x4, plane_normal_2x2, plane_param
 
 class encoder(nn.Module):
     def __init__(self, params):
@@ -320,73 +374,3 @@ class BtsModel(nn.Module):
     def forward(self, x, focal):
         skip_feat = self.encoder(x)
         return self.decoder(skip_feat, focal)
-
-
-if __name__ == "__main__":
-    import os, glob
-    import argparse
-    from PIL import Image
-    import torchvision.transforms as T
-    import matplotlib.pyplot as plt
-    plasma = plt.get_cmap('plasma')
-    greys = plt.get_cmap('Greys')
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--img_path', default='test.jpg')
-    parser.add_argument('--bts_size', default=512)
-    parser.add_argument('--max_depth', default=10)
-    parser.add_argument('--encoder', default='densenet161_bts')
-    parser.add_argument('--dataset', default='nyu')
-    parser.add_argument('--checkpoint_path', default='./depth_model')
-    parser.add_argument('--save_dir', default='./')
-
-    args = parser.parse_args()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    transforms = T.Compose([
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-
-    model = BtsModel(params=args).cuda()
-    model = torch.nn.DataParallel(model)
-
-    checkpoint = torch.load(args.checkpoint_path)
-    model.load_state_dict(checkpoint['model'])
-    model.cuda()
-    model.eval()
-
-    if os.path.isdir(args.img_path):
-        imgs = sorted(glob.glob(os.path.join(args.img_path, '*.jpg')))
-    else:
-        imgs = [args.img_path]
-
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-
-    with torch.no_grad():
-        for i, img in enumerate(imgs):
-            name = img.split('/')[-1]
-            print(i, name)
-            input_image = Image.open(img)
-            raw_w, raw_h = input_image.size
-            input_images = transforms(input_image.resize((640, 480)))
-
-            # input_image = np.array(input_image.resize((640, 480)), dtype=np.float32)
-            # input_image[:, :, 0] = (input_image[:, :, 0] - 123.68) * 0.017
-            # input_image[:, :, 1] = (input_image[:, :, 1] - 116.78) * 0.017
-            # input_image[:, :, 2] = (input_image[:, :, 2] - 103.94) * 0.017
-            # input_images = np.expand_dims(input_image, axis=0)
-            # input_images = np.transpose(input_images, (0, 3, 1, 2))
-            # image = torch.from_numpy(input_images).cuda()
-
-            image = input_images.unsqueeze(0).cuda()
-            _, _, _, _, _, depth = model(image)
-            depth = depth.squeeze().cpu().numpy() * 1000
-            Image.fromarray(depth).convert('I').resize((raw_w, raw_h)).save(
-                os.path.join(args.save_dir, name.replace('.jpg', '.png')))
-
-            # grey_depth = (greys(np.log10(depth))[:, :, :3] * 255).astype('uint8')
-            # Image.fromarray(grey_depth).save('grey_depth.png')
-            # plasma_depth = (plasma(np.log10(depth))[:, :, :3] * 255).astype('uint8')
-            # Image.fromarray(plasma_depth ).save('plasma_depth.png')

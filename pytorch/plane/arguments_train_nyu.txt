@@ -1,0 +1,33 @@
+--mode train
+--model_name bts_plane_v1.1
+--encoder densenet161_bts
+--dataset nyu
+--data_path /versa/dyy/dataset/nyu_depth_v2/plane_npz/
+--filenames_file /versa/dyy/dataset/nyu_depth_v2/plane_train.txt
+--batch_size 32
+--num_epochs 100
+--learning_rate 1e-4
+--weight_decay 1e-2
+--adam_eps 1e-3
+--num_threads 0
+--input_height 416
+--input_width 544
+--max_depth 10
+--do_random_rotate
+--degree 2.5
+--log_directory ./models
+--multiprocessing_distributed
+--dist_url tcp://127.0.0.1:2345
+--checkpoint_path ./models/bts_plane_v1/model-5600-0.37115
+--inlier_loss_weight 1.
+--param_loss_weight 0.25
+
+--log_freq 50
+--do_online_eval
+--eval_freq 200
+--data_path_eval /versa/dyy/dataset/nyu_depth_v2/plane_npz/
+--filenames_file_eval /versa/dyy/dataset/nyu_depth_v2/plane_val.txt
+--min_depth_eval 1e-3
+--max_depth_eval 10
+--eval_summary_directory ./models/eval/
+--eigen_crop
