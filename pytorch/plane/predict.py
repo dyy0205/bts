@@ -6,7 +6,7 @@ import cv2
 import argparse
 import torchvision.transforms as T
 
-from bts import BtsModel
+from bts_plane import BtsModel
 from mmdet.apis import init_detector, inference_detector
 
 SOLO_CLASSES = ('floor', 'wall', 'door', 'window', 'curtain', 'painting', 'wall_o',
@@ -91,6 +91,7 @@ def plane_postprocess(pred_norms, instance_map):
     plane_depth = 1. / np.sum(K_inv_dot_xy_1.reshape(3, -1) * pred_norms.reshape(3, -1), axis=0)
     plane_depth = plane_depth.reshape(h, w)
     plane_depth[instance_map == 0] = 0.
+    plane_depth[plane_depth < 0] = -plane_depth[plane_depth < 0]
 
     return plane_norms, plane_depth
 

@@ -38,7 +38,7 @@ import matplotlib.cm
 import threading
 from tqdm import tqdm
 
-from bts import *
+from bts_plane import *
 from bts_dataloader import *
 
 
