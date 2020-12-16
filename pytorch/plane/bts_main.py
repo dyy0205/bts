@@ -420,6 +420,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.retrain:
         global_step = 0
+        best_eval_plane_lower_better = torch.zeros(1).cpu() + 1e3
 
     cudnn.benchmark = True
 
@@ -539,7 +540,8 @@ def main_worker(gpu, ngpus_per_node, args):
                     checkpoint = {'global_step': global_step,
                                   'model': model.state_dict(),
                                   'optimizer': optimizer.state_dict()}
-                    torch.save(checkpoint, args.log_directory + '/' + args.model_name + '/model-{}'.format(global_step))
+                    torch.save(checkpoint, args.log_directory + '/' + args.model_name + '/model-{}'.format(global_step),
+                               _use_new_zipfile_serialization=False)
 
             if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
                 time.sleep(0.1)
@@ -596,7 +598,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                           'best_eval_plane_lower_better': best_eval_plane_lower_better,
                                           'best_eval_steps': best_eval_steps
                                           }
-                            torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+                            torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name,
+                                       _use_new_zipfile_serialization=False)
 
                     eval_summary_writer.flush()
                 model.train()
