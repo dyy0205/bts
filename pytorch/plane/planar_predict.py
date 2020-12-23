@@ -7,8 +7,10 @@ import argparse
 import torchvision.transforms as T
 import random
 
-from bts_plane2 import BtsModel
+from bts import BtsModel
 from mmdet.apis import init_detector, inference_detector
+from planar import NormalEstimator
+
 
 SOLO_CLASSES = ('floor', 'wall', 'door', 'window', 'curtain', 'painting', 'wall_o',
                 'ceiling', 'fan', 'bed', 'desk', 'cabinet', 'chair', 'sofa',
@@ -39,26 +41,35 @@ def precompute_K_inv_dot_xy_1(focal_length, h, w):
     return K_inv_dot_xy_1
 
 
-def precompute_K_inv_dot_xy1(focal, h, w):
-    offset_x = 320
-    offset_y = 240
-    K = [[focal, 0, offset_x],
-         [0, focal, offset_y],
-         [0, 0, 1]]
-    K_inv = np.linalg.inv(np.array(K))
-    # [[1./focal, 0, -offset_x/focal],
-    #  [0, 1./focal, -offset_y/focal],
-    #  [0, 0, 1]]
+def plane_postprocess(pred_norms, pred_depth, instance_map):
+    h, w = instance_map.shape
+    plane_norms, plane_pixels = [], []
+    for ins in np.unique(instance_map):
+        if ins == 0:
+            continue
+        mask = instance_map == ins
+        ins_norm = pred_norms[:, mask].mean(axis=1)
+        pred_norms[:, mask] = ins_norm.repeat(mask.sum()).reshape(3, -1)
+        plane_norms.append(ins_norm)
 
-    x = np.arange(w, dtype=np.float32).reshape(1, w) / w * 640
-    y = np.arange(h, dtype=np.float32).reshape(h, 1) / h * 480
-    xx = np.tile(x, h).reshape(h, -1)
-    yy = np.tile(y, w)
+        pixels = list(zip(*np.nonzero(mask)))
+        plane_pixels.append(pixels[len(pixels)//2])
 
-    xy1 = np.stack((xx, yy, np.ones((h, w), dtype=np.float32)))  # (3, h, w)
-    xy1 = xy1.reshape(3, -1)  # (3, h*w)
-    k_inv_dot_xy1 = np.matmul(K_inv, xy1).reshape(3, h, w)  # (3, h, w)
-    return k_inv_dot_xy1
+    final_depth = np.zeros_like(pred_depth)
+    for i in range(len(plane_norms)):
+        normal = plane_norms[i]
+        v, u = plane_pixels[i]
+        x, y, z = K_inv_dot_xy_1[:, v, u] * pred_depth[v, u]
+        D = -np.sum(np.multiply(normal, np.array([x, y, z])))
+
+        mask = instance_map == (i+1)
+        final_depth[mask] = D.repeat(mask.sum())
+
+    plane_depth = -final_depth.reshape(-1) / np.sum(K_inv_dot_xy_1.reshape(3, -1) * pred_norms.reshape(3, -1), axis=0)
+    plane_depth = plane_depth.reshape(h, w)
+    plane_depth[instance_map == 0] = 0.
+
+    return plane_norms, plane_depth
 
 
 def solo_infer(model, img_np, conf, plane_cls, h, w):
@@ -100,38 +111,7 @@ def solo_infer(model, img_np, conf, plane_cls, h, w):
         return masks, classes, plane_ins, plane_cate, instance_map
 
 
-def plane_postprocess(pred_norms, pred_depth, instance_map):
-    h, w = instance_map.shape
-    plane_norms, plane_pixels = [], []
-    for ins in np.unique(instance_map):
-        if ins == 0:
-            continue
-        mask = instance_map == ins
-        ins_norm = pred_norms[:, mask].mean(axis=1)
-        pred_norms[:, mask] = ins_norm.repeat(mask.sum()).reshape(3, -1)
-        plane_norms.append(ins_norm)
-
-        pixels = list(zip(*np.nonzero(mask)))
-        plane_pixels.append(pixels[len(pixels)//2])
-
-    final_depth = np.zeros_like(pred_depth)
-    for i in range(len(plane_norms)):
-        normal = plane_norms[i]
-        v, u = plane_pixels[i]
-        x, y, z = K_inv_dot_xy_1[:, v, u] * pred_depth[v, u]
-        D = -np.sum(np.multiply(normal, np.array([x, y, z])))
-
-        mask = instance_map == (i+1)
-        final_depth[mask] = D.repeat(mask.sum())
-
-    plane_depth = -final_depth.reshape(-1) / np.sum(K_inv_dot_xy_1.reshape(3, -1) * pred_norms.reshape(3, -1), axis=0)
-    plane_depth = plane_depth.reshape(h, w)
-    plane_depth[instance_map == 0] = 0.
-
-    return plane_norms, plane_depth
-
-
-def predict(args, bts_model, solo_model):
+def predict(args, solo_model, bts_model, plane_model):
     h, w = args.input_height, args.input_width
 
     if os.path.isdir(args.image_path):
@@ -148,16 +128,18 @@ def predict(args, bts_model, solo_model):
             image = transforms(image_pil.resize((w, h)))
             image = image.unsqueeze(0).cuda()
 
-            # SOLO infer
+            # SOLO
             solo_masks, solo_cates, plane_ins, plane_cate, instance_map = \
                 solo_infer(solo_model, image_np, args.solo_conf, args.plane_cls, h, w)
 
             # BTS infer
-            _, _, _, _, pred_depth, _, _, _, pred_norms = bts_model(
-                image, torch.LongTensor(instance_map).unsqueeze(0).cuda(),
-                torch.FloatTensor(K_inv_dot_xy_1).cuda(), focal=args.focal)
-            pred_depth = pred_depth.cpu().numpy().squeeze()
+            _, _, _, _, last_feat, pred_depth = bts_model(image, args.focal)
+
+            # plane model
+            rough_normals, pred_norms = plane_model(pred_depth,
+                        torch.FloatTensor(K_inv_dot_xy_1).cuda(), torch.FloatTensor(instance_map).unsqueeze(0).cuda())
             pred_norms = pred_norms.cpu().numpy().squeeze()
+            pred_depth = pred_depth.cpu().numpy().squeeze()
 
             plane_norms, plane_depth = plane_postprocess(pred_norms, pred_depth, instance_map)
 
@@ -194,21 +176,28 @@ if __name__ == '__main__':
     parser.add_argument('--input_height', type=int, help='input height', default=480)
     parser.add_argument('--input_width', type=int, help='input width', default=640)
     parser.add_argument('--image_path', type=str, default='./val_imgs')
+    parser.add_argument('--plane_ckpt', type=str, default='./models/planar/model-8400-0.32838')
     args = parser.parse_args()
 
     K_inv_dot_xy_1 = precompute_K_inv_dot_xy_1(args.focal, args.input_height, args.input_width)
-    # K_inv_dot_xy1 = precompute_K_inv_dot_xy1(args.focal, args.input_height, args.input_width)
-
-    # BTS
-    bts_model = BtsModel(params=args).cuda()
-    bts_ckpt = torch.load(args.bts_ckpt)
-    # bts_ckpt = {k.replace('module.', ''): v for k, v in bts_ckpt['model'].items()}
-    bts_ckpt = {k[7:]: v for k, v in bts_ckpt['model'].items()}
-    bts_model.load_state_dict(bts_ckpt)
-    bts_model.cuda()
-    bts_model.eval()
 
     # SOLO
     solo_model = init_detector(args.solo_cfg, args.solo_ckpt, device='cuda:0')
 
-    predict(args, bts_model, solo_model)
+    # BTS
+    bts_model = BtsModel(params=args)
+    bts_ckpt = torch.load(args.bts_ckpt)
+    bts_ckpt = {k.replace('module.', ''): v for k, v in bts_ckpt['model'].items()}
+    bts_model.load_state_dict(bts_ckpt)
+    bts_model.cuda()
+    bts_model.eval()
+
+    # plane model
+    plane_model = NormalEstimator()
+    plane_ckpt = torch.load(args.plane_ckpt)
+    plane_ckpt = {k.replace('module.', ''): v for k, v in plane_ckpt['model'].items()}
+    plane_model.load_state_dict(plane_ckpt)
+    plane_model.cuda()
+    plane_model.eval()
+
+    predict(args, solo_model, bts_model, plane_model)

@@ -38,7 +38,7 @@ import matplotlib.cm
 import threading
 from tqdm import tqdm
 
-from bts_plane import *
+from bts_plane2 import *
 from bts_dataloader import *
 
 
@@ -65,6 +65,7 @@ parser.add_argument('--filenames_file',            type=str,   help='path to the
 parser.add_argument('--input_height',              type=int,   help='input height', default=480)
 parser.add_argument('--input_width',               type=int,   help='input width',  default=640)
 parser.add_argument('--max_depth',                 type=float, help='maximum depth in estimation', default=10)
+parser.add_argument('--focal_length',                 type=float, help='maximum depth in estimation', default=518.8579)
 
 # Log and save
 parser.add_argument('--log_directory',             type=str,   help='directory to save checkpoints and summaries', default='')
@@ -145,6 +146,29 @@ inv_normalize = transforms.Normalize(
 )
 
 eval_metrics = ['silog', 'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3', 'plane_err']
+
+
+def precompute_K_inv_dot_xy_1(h, w, focal):
+    offset_x = 320
+    offset_y = 240
+    K = [[focal, 0, offset_x],
+         [0, focal, offset_y],
+         [0, 0, 1]]
+    K_inv = np.linalg.inv(np.array(K))
+    # [[1./focal, 0, -offset_x/focal],
+    #  [0, 1./focal, -offset_y/focal],
+    #  [0, 0, 1]]
+    K_inv = torch.FloatTensor(K_inv)
+
+    x = torch.arange(w, dtype=torch.float32).view(1, w) / w * 640
+    y = torch.arange(h, dtype=torch.float32).view(h, 1) / h * 480
+    xx = x.repeat(h, 1)
+    yy = y.repeat(1, w)
+
+    xy1 = torch.stack((xx, yy, torch.ones((h, w), dtype=torch.float32)))  # (3, h, w)
+    xy1 = xy1.view(3, -1)  # (3, h*w)
+    k_inv_dot_xy1 = torch.matmul(K_inv, xy1).reshape(3, h, w)  # (3, h, w)
+    return k_inv_dot_xy1
 
 
 def compute_errors(gt, pred):
@@ -269,7 +293,7 @@ def set_misc(model):
                 parameters.requires_grad = False
 
 
-def online_eval(model, dataloader_eval, gpu, ngpus):
+def online_eval(model, dataloader_eval, k_inv_dot_xy1_eval, gpu, ngpus):
     eval_measures = torch.zeros(11).cuda(device=gpu)
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
         with torch.no_grad():
@@ -279,7 +303,7 @@ def online_eval(model, dataloader_eval, gpu, ngpus):
             gt_plane = eval_sample_batched['plane']
             ins_mask = eval_sample_batched['mask']
 
-            _, _, _, _, pred_depth, _, _, _, pred_plane = model(image, focal)
+            _, _, _, _, pred_depth, _, _, _, pred_plane = model(image, ins_mask, k_inv_dot_xy1_eval, focal)
 
             pred_depth = pred_depth.cpu().numpy().squeeze()
             pred_plane = pred_plane.cpu().numpy().squeeze()
@@ -424,11 +448,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.retrain:
         global_step = 0
+        best_eval_plane_lower_better = torch.zeros(1).cpu() + 1e3
 
     cudnn.benchmark = True
 
     dataloader = BtsDataLoader(args, 'train')
     dataloader_eval = BtsDataLoader(args, 'online_eval')
+    k_inv_dot_xy1 = precompute_K_inv_dot_xy_1(args.input_height, args.input_width, args.focal_length).cuda(device=gpu)
+    k_inv_dot_xy1_eval = precompute_K_inv_dot_xy_1(480, 640, args.focal_length).cuda(device=gpu)
 
     # Logging
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
@@ -473,7 +500,7 @@ def main_worker(gpu, ngpus_per_node, args):
             ins_mask = torch.autograd.Variable(sample_batched['mask'].cuda(args.gpu, non_blocking=True))   # (N, 20, H, W)
             plane_gt = torch.autograd.Variable(sample_batched['plane'].cuda(args.gpu, non_blocking=True))  # (N, 20, 3)
 
-            lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est, plane8x8, plane4x4, plane2x2, plane_est = model(image, focal)
+            lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est, plane8x8, plane4x4, plane2x2, plane_est = model(image, ins_mask, k_inv_dot_xy1, focal)
 
             if args.dataset == 'nyu':
                 mask = depth_gt > 0.1
@@ -548,7 +575,7 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
                 time.sleep(0.1)
                 model.eval()
-                eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node)
+                eval_measures = online_eval(model, dataloader_eval, k_inv_dot_xy1_eval, gpu, ngpus_per_node)
                 if eval_measures is not None:
                     for i in range(10):
                         eval_summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))

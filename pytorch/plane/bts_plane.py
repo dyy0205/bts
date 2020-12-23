@@ -266,6 +266,8 @@ class bts(nn.Module):
 
         self.plane1x1 = reduction_1x1(num_features // 16, num_features // 32, self.params.max_depth, is_final=False)
         self.plane_conv = torch.nn.Sequential(nn.Conv2d(num_features // 16 + 12, num_features // 16, 3, 1, 1, bias=False),
+                                              nn.ELU(),
+                                              nn.Conv2d(num_features // 16, num_features // 16, 3, 1, 1, bias=False),
                                               nn.ELU())
         self.get_plane = torch.nn.Sequential(nn.Conv2d(num_features // 16, 3, 3, 1, 1, bias=False))
 
