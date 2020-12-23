@@ -269,7 +269,11 @@ class bts(nn.Module):
                                               nn.ELU(),
                                               nn.Conv2d(num_features // 16, num_features // 16, 3, 1, 1, bias=False),
                                               nn.ELU())
-        self.get_plane = torch.nn.Sequential(nn.Conv2d(num_features // 16, 3, 3, 1, 1, bias=False))
+        self.get_planes = torch.nn.Sequential(nn.Conv2d(num_features // 8, num_features // 16, 3, 1, 1, bias=False),
+                                             nn.ELU(),
+                                             nn.Conv2d(num_features // 16, num_features // 16, 3, 1, 1, bias=False),
+                                             nn.ELU(),
+                                             nn.Conv2d(num_features // 16, 3, 3, 1, 1, bias=False))
 
     def forward(self, features, focal):
         skip0, skip1, skip2, skip3 = features[1], features[2], features[3], features[4]
@@ -346,7 +350,8 @@ class bts(nn.Module):
         plane_normal_1x1 = torch_nn_func.normalize(plane_normal_1x1, 2, 1)  # H, 3
         plane_concat = torch.cat([upconv1, plane_normal_1x1, plane_2x2, plane_4x4, plane_8x8], dim=1)
         plane_feat = self.plane_conv(plane_concat)
-        final_plane_normal = self.get_plane(plane_feat)
+        last_feat = torch.cat([plane_feat, iconv1], dim=1)
+        final_plane_normal = self.get_planes(last_feat)
 
         return depth_8x8_scaled, depth_4x4_scaled, depth_2x2_scaled, reduc1x1, final_depth, \
                plane_normal_8x8, plane_normal_4x4, plane_normal_2x2, final_plane_normal
